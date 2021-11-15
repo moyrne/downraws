@@ -12,14 +12,18 @@ import (
 
 type DownRaws struct {
 	downFunc func(ctx context.Context, limit, offset int) ([][]interface{}, error)
-	fields   []string
+	// TODO write fields to file
+	fields []string
 
 	// Prohibit limit greater than maxRaw
 	limit  int
 	offset int
 	maxRaw int
 
-	driver Driver
+	driver     Driver
+	idx        int
+	writeCount int
+	writer     Writer
 
 	filename  string
 	zipBuffer *bytes.Buffer
@@ -45,6 +49,7 @@ func New(driverName, filename string, fn func(ctx context.Context, limit, offset
 		offset:    0,
 		maxRaw:    3000,
 		driver:    driver,
+		writer:    driver.NewWriter(),
 		filename:  filename,
 		zipBuffer: zipBuffer,
 		zipWriter: zip.NewWriter(zipBuffer),
@@ -63,72 +68,59 @@ func New(driverName, filename string, fn func(ctx context.Context, limit, offset
 }
 
 func (r *DownRaws) LoadData(ctx context.Context) error {
-	return r.safeClose(func() error {
-		var (
-			idx        int
-			writeCount int
-			writer     = r.driver.NewWriter()
-		)
-		for ; ; r.offset += r.limit {
-			if ctx.Err() != nil {
-				return errors.WithStack(ctx.Err())
-			}
+	for ; ; r.offset += r.limit {
+		if ctx.Err() != nil {
+			return errors.WithStack(ctx.Err())
+		}
 
-			data, err := r.downFunc(ctx, r.limit, r.offset)
-			if err != nil {
-				return err
-			}
-			if len(data) == 0 {
-				break
-			}
+		data, err := r.downFunc(ctx, r.limit, r.offset)
+		if err != nil {
+			return err
+		}
+		if len(data) == 0 {
+			break
+		}
 
-			for i := 0; i < len(data); i++ {
-				if writeCount >= r.maxRaw {
-					idx++
-					f, err := r.zipWriter.Create(r.filename + "_" + strconv.Itoa(idx) + r.driver.Suffix())
-					if err != nil {
-						return errors.WithStack(err)
-					}
-					if _, err := writer.WriteTo(f); err != nil {
-						return err
-					}
-					writer = r.driver.NewWriter()
-					writeCount = 0
+		for i := 0; i < len(data); i++ {
+			if r.writeCount >= r.maxRaw {
+				r.idx++
+				f, err := r.zipWriter.Create(r.filename + "_" + strconv.Itoa(r.idx) + r.driver.Suffix())
+				if err != nil {
+					return errors.WithStack(err)
 				}
-				if err := writer.Write(data[i]...); err != nil {
+				if _, err := r.writer.WriteTo(f); err != nil {
 					return err
 				}
-				writeCount++
+				r.writer = r.driver.NewWriter()
+				r.writeCount = 0
 			}
-		}
-
-		if writeCount != 0 {
-			idx++
-			f, err := r.zipWriter.Create(r.filename + "_" + strconv.Itoa(idx) + r.driver.Suffix())
-			if err != nil {
-				return errors.WithStack(err)
-			}
-			if _, err := writer.WriteTo(f); err != nil {
+			if err := r.writer.Write(data[i]...); err != nil {
 				return err
 			}
+			r.writeCount++
 		}
+	}
 
-		if err := r.zipWriter.Flush(); err != nil {
+	if r.writeCount != 0 {
+		r.idx++
+		f, err := r.zipWriter.Create(r.filename + "_" + strconv.Itoa(r.idx) + r.driver.Suffix())
+		if err != nil {
 			return errors.WithStack(err)
 		}
+		if _, err := r.writer.WriteTo(f); err != nil {
+			return err
+		}
+	}
 
-		return errors.WithStack(r.zipWriter.Close())
-	})
+	if err := r.zipWriter.Flush(); err != nil {
+		return errors.WithStack(err)
+	}
+
+	return errors.WithStack(r.zipWriter.Close())
 }
 
-func (r *DownRaws) safeClose(fn func() error) error {
-	if err := fn(); err != nil {
-		if e := r.zipWriter.Close(); e != nil {
-			return errors.WithMessagef(err, "close failed: %v", e)
-		}
-		return err
-	}
-	return nil
+func (r *DownRaws) Close() error {
+	return errors.WithStack(r.zipWriter.Close())
 }
 
 func (r *DownRaws) WriteTo(writer io.Writer) (int64, error) {
